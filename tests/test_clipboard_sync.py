@@ -30,6 +30,8 @@ from usb_clipboard_sync import (
     LogStream,
     set_console_visible,
     CREATE_NO_WINDOW,
+    get_fixed_bin_dir,
+    get_base_dirs,
 )
 
 
@@ -486,6 +488,41 @@ class TestClipboardSyncEngine(unittest.TestCase):
         self.assertTrue(len(installed_cmds) >= 1)
         self.assertIn("-r", installed_cmds[0])
         self.assertIn("-g", installed_cmds[0])
+
+
+class TestPersistentBinAndAdb(unittest.TestCase):
+    def test_get_fixed_bin_dir_dev_mode(self):
+        b_dir = get_fixed_bin_dir()
+        self.assertTrue(os.path.isdir(b_dir))
+        self.assertTrue(os.path.isfile(os.path.join(b_dir, "adb.exe")))
+
+    def test_get_fixed_bin_dir_frozen_mode(self):
+        with unittest.mock.patch("sys.frozen", True, create=True), \
+             unittest.mock.patch("sys._MEIPASS", "C:\\fake\\temp\\_MEI12345", create=True), \
+             unittest.mock.patch("sys.executable", "C:\\fake\\install\\app.exe"):
+            b_dir = get_fixed_bin_dir()
+            self.assertIn("usb_clipboard_sync", b_dir)
+            self.assertTrue(b_dir.endswith("bin"))
+
+    def test_find_adb_extracts_on_frozen(self):
+        import tempfile
+        with tempfile.TemporaryDirectory() as fake_meipass, tempfile.TemporaryDirectory() as fake_appdata:
+            fake_adb = os.path.join(fake_meipass, "adb.exe")
+            with open(fake_adb, "wb") as f:
+                f.write(b"FAKE_ADB_BINARY")
+            fake_dll = os.path.join(fake_meipass, "AdbWinApi.dll")
+            with open(fake_dll, "wb") as f:
+                f.write(b"FAKE_DLL")
+
+            target_bin = os.path.join(fake_appdata, "usb_clipboard_sync", "bin")
+
+            with unittest.mock.patch("sys.frozen", True, create=True), \
+                 unittest.mock.patch("sys._MEIPASS", fake_meipass, create=True), \
+                 unittest.mock.patch("sys.executable", "C:\\Program Files\\app\\app.exe"), \
+                 unittest.mock.patch.dict(os.environ, {"LOCALAPPDATA": fake_appdata}):
+                engine = ClipboardSyncEngine(port=29998)
+                self.assertTrue(os.path.isfile(os.path.join(target_bin, "adb.exe")))
+                self.assertEqual(engine.adb_cmd, os.path.join(target_bin, "adb.exe"))
 
 
 if __name__ == "__main__":

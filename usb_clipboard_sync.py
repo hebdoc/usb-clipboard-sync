@@ -18,6 +18,7 @@ from ctypes import wintypes
 import random
 import hashlib
 import io
+import shutil
 from typing import Optional, Tuple, Callable
 
 class LogStream:
@@ -261,9 +262,50 @@ class ScrcpyProtocol:
             return msg_type, None
 
 
+def get_fixed_bin_dir() -> str:
+    """返回用于存放 adb.exe 及底层运行库的固定持久化目录。
+
+    原因说明：
+    Windows 防火墙规则严格绑定可执行文件的绝对物理路径。
+    在 PyInstaller 单文件打包模式下，每次运行都会解压到临时的 AppData\\Local\\Temp\\_MEIxxxxxx 随机目录。
+    这导致 adb.exe 启动并监听本地端口 (127.0.0.1:5037) 时，Windows 防火墙因路径每次都不同，
+    将其判定为未知的全新软件，从而在每次启动软件时都强制弹出安全警告确认对话框。
+
+    通过将 adb.exe 及配套 DLL 提取并固定存放在稳定的本地目录中（优先源码/便携同级 bin，
+    若不存在则固定持久化到 %LOCALAPPDATA%\\usb_clipboard_sync\\bin），
+    Windows 防火墙只需用户确认放行一次，即可永久记忆规则，彻底避免后续重复弹窗！
+    """
+    # 1. 源码开发环境（未打包且本地 bin 存在）
+    if not (getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS")):
+        dev_bin = os.path.join(os.path.dirname(os.path.abspath(__file__)), "bin")
+        if os.path.isdir(dev_bin) and os.path.isfile(os.path.join(dev_bin, "adb.exe")):
+            return dev_bin
+
+    # 2. 检查可执行文件同级目录下的 bin/adb.exe（便携多文件发行包）
+    if hasattr(sys, "executable") and sys.executable:
+        exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+        exe_bin = os.path.join(exe_dir, "bin")
+        if os.path.isdir(exe_bin) and os.path.isfile(os.path.join(exe_bin, "adb.exe")):
+            return exe_bin
+
+    # 3. 单文件运行模式：固定持久化到 %LOCALAPPDATA%\usb_clipboard_sync\bin
+    app_data = os.environ.get("LOCALAPPDATA", os.path.expanduser("~"))
+    persistent_bin = os.path.join(app_data, "usb_clipboard_sync", "bin")
+    try:
+        os.makedirs(persistent_bin, exist_ok=True)
+    except Exception:
+        pass
+    return persistent_bin
+
+
 def get_base_dirs():
     """返回所有可能的资源搜索根目录（支持源码运行、便携版运行及 PyInstaller 单文件打包）"""
     dirs = []
+    # 0. 优先持久化固定目录（确保找到已提取的稳定二进制）
+    fixed_bin = get_fixed_bin_dir()
+    if fixed_bin:
+        dirs.append(fixed_bin)
+
     # 1. PyInstaller 打包后的解压临时目录
     if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
         dirs.append(sys._MEIPASS)
@@ -320,6 +362,34 @@ class ClipboardSyncEngine:
 
     def _find_adb(self) -> str:
         """查找自带或系统的 adb 可执行文件路径"""
+        fixed_dir = get_fixed_bin_dir()
+        fixed_adb = os.path.join(fixed_dir, "adb.exe")
+
+        # 若处于 PyInstaller 单文件打包环境，确保将 bundled 的 adb 提取到固定持久化目录
+        if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+            src_adb = os.path.join(sys._MEIPASS, "adb.exe")
+            if not os.path.isfile(src_adb):
+                src_adb = os.path.join(sys._MEIPASS, "bin", "adb.exe")
+
+            if os.path.isfile(src_adb):
+                src_dir = os.path.dirname(src_adb)
+                for fname in ["adb.exe", "AdbWinApi.dll", "AdbWinUsbApi.dll", "scrcpy-server", "ShareToPC.apk"]:
+                    s_file = os.path.join(src_dir, fname)
+                    d_file = os.path.join(fixed_dir, fname)
+                    if os.path.isfile(s_file):
+                        try:
+                            if not os.path.isfile(d_file) or os.path.getsize(s_file) != os.path.getsize(d_file):
+                                shutil.copy2(s_file, d_file)
+                        except Exception:
+                            pass
+
+        if os.path.isfile(fixed_adb):
+            cur_path = os.environ.get("PATH", "")
+            if fixed_dir.lower() not in cur_path.lower():
+                os.environ["PATH"] = fixed_dir + os.pathsep + cur_path
+            self.adb_cmd = fixed_adb
+            return fixed_adb
+
         candidates = []
         for base in get_base_dirs():
             candidates.append(os.path.join(base, "adb.exe"))
